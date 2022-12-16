@@ -6,6 +6,8 @@ Forked from <https://github.com/erikreed/pydupes> and converted from a CLI tool 
 > that may be faster in environments with millions of files and terabytes
 > of data or over high latency filesystems (e.g. NFS).
 
+If there's enough interest I'll publish this as a pip package.
+
 ## Setup
 
 ```bash
