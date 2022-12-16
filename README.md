@@ -1,6 +1,6 @@
 # pydupes-library
 
-Forked from <https://github.com/erikreed/pydupes> and converted from a CLI tool into an importable library. It's pretty much the same implementation as the original and imports as much as possible from the original code.
+Forked from <https://github.com/erikreed/pydupes> and converted from a CLI tool into an importable library. It's pretty much the same implementation and imports as much as possible from the original code.
 
 > `pydupes` is yet another duplicate file finder like rdfind/fdupes et al
 > that may be faster in environments with millions of files and terabytes
