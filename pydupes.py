@@ -1,374 +1,196 @@
-import collections
 import datetime
-import functools
-import gzip
-import hashlib
-import itertools
-import json
 import logging
-import os.path
-import pathlib
-import queue
-import stat
-import threading
-import typing
-from collections import defaultdict
+import os
+import shutil
+import subprocess
+import sys
+import time
+from hashlib import sha256
+from itertools import tee
+from logging import Logger
+from pathlib import Path
+from typing import Union
 
-import click
+from imohash import hashfile
+from natsort import natsorted
+from pydupes import (
+    DupeFinder, FileCrawler, DuplicateComparator,
+    FatalCrawlException, main, FutureFreeThreadPool)
+from pydupes import traverse_paths, sizeof_fmt
 from tqdm import tqdm
 
-# size of buffer to use when reading files for hashing or boundary comparison
-THREAD_MEMORY_BUFFER = 128 * 1024
 
-# size of beginning and edge boundary chunks to compare
-BOUNDARY_CHECK_SIZE = 4096
-CHECKPOINT_SCHEMA = 'pydupes-v1'
+# pip install imohash
 
-lock = threading.Lock()
-logger = logging.getLogger('pydupes')
-thread_local = threading.local()
-
-
-def none_if_io_error(f):
-    @functools.wraps(f)
-    def wrapper(path, *args, **kwds):
-        try:
-            return f(path, *args, **kwds)
-        except IOError as e:
-            logger.error('Unable to read "%s" due to: %s', path, e)
-
-    return wrapper
+def generate_hash(file: Union[str, Path]) -> str:
+    # block_size = 65536
+    # filehash = sha256()
+    try:
+        filehash = hashfile(file, hexdigest=True)
+        return filehash
+        # with open(file, 'rb') as f:
+        #     fileblock = f.read(block_size)
+        #     while len(fileblock) > 0:
+        #         filehash.update(fileblock)
+        #         fileblock = f.read(block_size)
+        #     filehash = filehash.hexdigest()
+        # return filehash
+    except Exception as e:
+        tqdm.write(f'Exception {e} on {file}')
+        return '-1'
 
 
-def sizeof_fmt(num, suffix="B"):
-    for unit in ["", "Ki", "Mi", "Gi", "Ti", "Pi", "Ei", "Zi"]:
-        if abs(num) < 1024.0:
-            return f"{num:3.1f}{unit}{suffix}"
-        num /= 1024.0
-    return f"{num:.3f}Yi{suffix}"
+def num_files(path) -> int:
+    s = subprocess.run(f'ls -1q {path} | wc -l', shell=True, capture_output=True).stdout.decode().strip('\n')
+    return int(s)
 
 
-@none_if_io_error
-def sha256sum(path: str) -> bytes:
-    hasher = hashlib.sha256()
-    view = thread_local.memory_view
-    with open(path, 'rb', buffering=0) as f:
-        for n in iter(lambda: f.readinto(view), 0):
-            hasher.update(view[:n])
-    return hasher.digest()
+# def fdupes(input_path: Union[str, Path], recursive: bool = False, dry_run: bool = False):
+#     are_there_files_to_delete = False
+#     count_cleaned = 0
+#     file_hashes = {}  # file to keep: {[to delete, to delete, ...]}
+#
+#     if not Path(input_path).exists():
+#         raise FileNotFoundError
+#     elif Path(input_path).is_file():
+#         raise NotADirectoryError
+#
+#     if dry_run:
+#         print('Dry run, not deleting files.')
+#
+#     if recursive:
+#         files = Path(input_path).rglob('*')
+#     else:
+#         files = Path(input_path).iterdir()
+#     # bar gets stuck doing the scan so we have to set it to a variable so we can call bar.___ later
+#     bar = tqdm(total=num_files(input_path), desc='Scanning files', leave=False)
+#     i = 0
+#     for f in files:
+#         # tqdm.write(str(f))
+#         if f.is_dir():
+#             continue
+#         filehash = generate_hash(f)
+#         if filehash == '-1':
+#             continue
+#         if filehash not in file_hashes.keys():
+#             file_hashes[filehash] = []
+#             file_hashes[filehash].append(f)  # the first element of the array is always the original file
+#         else:
+#             file_hashes[filehash].append(f)
+#             are_there_files_to_delete = True
+#         bar.update(1)
+#         bar.refresh()
+#         sys.stderr.flush()
+#         if i == 20000:
+#             break
+#         i += 1
+#     bar.close()
+#
+#     t = len(file_hashes.keys())
+#     if not are_there_files_to_delete:
+#         print('No duplicates found.')
+#         return
+#     for i, tp in tqdm(enumerate(file_hashes.items()), total=t, desc='Deleting files'):
+#         original = tp[0]
+#         original_path = None  # make pycharm happy
+#         duplicates = tp[1]
+#         to_delete = []
+#         for i, d in enumerate(duplicates):
+#             if i == 0:
+#                 original_path = d
+#                 continue
+#             to_delete.append(d)
+#             count_cleaned += 1
+#         to_delete = natsorted(to_delete)
+#         # Only print the '[+]' if there are duplicates
+#         if len(to_delete) > 0:
+#             tqdm.write(f'[+] {original_path}')
+#             for d in to_delete:
+#                 if not dry_run:
+#                     tqdm.write(f'\t[-] {d}')
+#                     os.remove(d)
+#                 else:
+#                     tqdm.write(f'\t[-d] {d}')
+#     print(f'Deleted {count_cleaned} duplicate files.')
 
 
-def _thread_init():
-    thread_local.memory_view = memoryview(bytearray(THREAD_MEMORY_BUFFER))
+# def pydupes_cli(*input_paths, output,
+#                 verbose: bool = False,
+#                 progress: bool = False,
+#                 read_concurrency: int = 4,
+#                 traversal_concurrency: int = 1,
+#                 traversal_checkpoint=None,
+#                 min_size: int = 1
+#                 ):
+#     """
+#     @click.command(help="A duplicate file finder that may be faster in environments with "
+#                     "millions of files and terabytes of data or over high latency filesystems.")
+# @click.argument('input_paths', type=click.Path(
+#     exists=True, file_okay=False, readable=True), nargs=-1)
+# @click.option('--output', type=click.File('w'),
+#               help='Save null-delimited input/duplicate filename pairs. For stdout use "-".')
+# @click.option('--verbose', is_flag=True, help='Enable debug logging.')
+# @click.option('--progress', is_flag=True, help='Enable progress bars.')
+# @click.option('--min-size', type=click.IntRange(min=0), default=1,
+#               help='Minimum file size (in bytes) to consider during traversal.')
+# @click.option('--read-concurrency', type=click.IntRange(min=1), default=4,
+#               help='I/O concurrency for reading files.')
+# @click.option('--traversal-concurrency', type=click.IntRange(min=1), default=1,
+#               help='I/O concurrency for traversal (stat and listing syscalls).')
+# @click.option('--traversal-checkpoint', type=click.Path(),
+#               help='Persist the traversal index in jsonl format, or load an '
+#                    'existing traversal if already exists. Use .gz extension to compress. Input paths are '
+#                    'ignored if a traversal checkpoint is loaded.')
+#     :param input_paths:
+#     :param output:
+#     :param verbose:
+#     :param progress:
+#     :param read_concurrency:
+#     :param traversal_concurrency:
+#     :param traversal_checkpoint:
+#     :param min_size:
+#     :return:
+#     """
+#     s = ''
+#     for x in input_paths:
+#         s = s + ' "' + x + '"'
+#     input_paths = s
+#     if verbose:
+#         verbose_flag = '--verbose'
+#     else:
+#         verbose_flag = ''
+#     if progress:
+#         progress_flag = '--progress'
+#     else:
+#         progress_flag = ''
+#     if traversal_checkpoint:
+#         trav_ckpt_flag = f'--traversal-checkpoint {traversal_checkpoint}'
+#     else:
+#         trav_ckpt_flag = ''
+#     subprocess.run(f'pydupes {input_paths} {progress_flag} {verbose_flag} --min-size {min_size} --read-concurrency {read_concurrency} --traversal-concurrency {traversal_concurrency} {trav_ckpt_flag} --output "{output}"', shell=True)
+
+def delete_dupes(dupes, progress_bar: bool = True):
+    if len(dupes) == 0:
+        print('No duplicates found.')
+        return
+    for dupe in tqdm(dupes, disable=(not progress_bar), desc='Deleting files'):
+        tqdm.write(f'[-] {dupe}')
+        os.remove(dupe)
+    print(f'Deleted {len(dupes)} duplicate files.')
 
 
-_thread_init()
-
-
-class FatalCrawlException(Exception):
-    pass
-
-
-# https://stackoverflow.com/a/59832404/1337136
-def cache():
-    s = {}
-    setdefault = s.setdefault
-    n = 0
-
-    def add(x):
-        nonlocal n
-        n += 1
-        return setdefault(x, n) != n
-
-    return add
-
-
-class DuplicateComparator:
-    def __init__(self, paths: typing.List[pathlib.Path]):
-        self._paths = tuple(paths)
-
-    def key(self, s: str) -> typing.Tuple[typing.Any, ...]:
-        for i, p in enumerate(self._paths):
-            if os.path.commonprefix((p, s)) == str(p):
-                match = i
-                break
-        else:
-            match = -len(self._paths)
-        return match, s.count('/'), len(s), s
-
-    def min(self, s1: str, s2: str) -> str:
-        return min((s1, s2), key=self.key)
-
-
-class FutureFreeThreadPool:
-    # TODO: benchmark https://github.com/brmmm3/fastthreadpool
-    def __init__(self, threads: int, queue_size: int = 32, init_fn=_thread_init):
-        assert threads >= 0
-        if threads <= 1:
-            threads = 0
-
-        self.init_fn = init_fn
-        self.work_queue = queue.Queue(maxsize=queue_size)
-        self.queue_size = queue_size
-        self.threads = [threading.Thread(target=self._worker_run, daemon=True)
-                        for _ in range(threads)]
-        self._threadid_to_event = defaultdict(threading.Event)
-        for t in self.threads:
-            t.start()
-
-    def wait_until_complete(self):
-        self.work_queue.join()
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
-        self.work_queue.join()
-        for _ in self.threads:
-            self.work_queue.put(None)
-        for t in self.threads:
-            t.join()
-
-    @staticmethod
-    def _run_task(fn, callback, args):
-        result = fn(*args)
-        if callback:
-            callback(result)
-
-    def _worker_run(self):
-        if self.init_fn:
-            self.init_fn()
-        try:
-            while True:
-                fn_args = self.work_queue.get(block=True)
-                if fn_args is None:
-                    return
-                self._run_task(*fn_args)
-                self.work_queue.task_done()
-                # allow GC
-                del fn_args
-        except Exception:
-            logger.exception('Unhandled error -- exit required')
-            exit(2)
-
-    def submit(self, fn, *args, callback=None):
-        if not self.threads or len(self.work_queue.queue) >= self.queue_size:
-            self._run_task(fn, callback, args)
-        else:
-            self.work_queue.put((fn, callback, args))
-
-    def map_unordered(self, fn, iterables):
-        size = len(iterables)
-        result = []
-        complete = self._threadid_to_event[threading.get_ident()]
-
-        def map_callback(out):
-            result.append(out)
-            if size == len(result):
-                complete.set()
-
-        for args in iterables:
-            self.submit(fn, *args, callback=map_callback)
-        complete.wait()
-        complete._flag = False
-        return result
-
-    def map(self, fn, iterables):
-        if not self.threads:
-            return list(map(fn, iterables))
-
-        wrapped = functools.partial(self._wrap_with_index, fn=fn)
-        iterables = list(enumerate(iterables))
-
-        result = self.map_unordered(wrapped, iterables)
-        result.sort(key=lambda ab: ab[0])
-        return [r for _, r in result]
-
-    @staticmethod
-    def _wrap_with_index(i, args, fn):
-        return i, fn(args)
-
-
-class FileCrawler:
-    def __init__(self, roots: typing.List[pathlib.Path],
-                 pool: FutureFreeThreadPool,
-                 progress: typing.Optional[tqdm] = None,
-                 min_size: int = 1):
-        assert roots
-        self._comparator = DuplicateComparator(roots)
-        if not all(r.is_dir() for r in roots):
-            raise FatalCrawlException("All roots required to be directories")
-        root_stats = [r.lstat() for r in roots]
-        root_device_ids = [r.st_dev for r in root_stats]
-        if len(set(root_device_ids)) != 1:
-            raise FatalCrawlException("Unable to span multiple devices")
-        self._root_device = root_device_ids[0]
-
-        self._size_to_paths = defaultdict(list)
-        self._pool = pool
-        self._roots = roots
-        self._traversed_inodes = cache()
-        self._prog = progress
-        self._min_size = min_size
-        self.num_directories = len(roots)
-
-    def _traverse_path(self, path: str):
-        frontier = collections.deque()
-        frontier.append(path)
-
-        while frontier:
-            path = frontier.popleft()
-            for p in os.scandir(path):
-                ppath = p.path
-                if self._prog is not None:
-                    self._prog.update(1)
-                try:
-                    pstat = p.stat(follow_symlinks=False)
-                except OSError as e:
-                    logger.error('Unable to stat %s due to: %s', ppath, e)
-                    continue
-                if pstat.st_dev != self._root_device:
-                    logger.debug('Skipping file on separate device %s', ppath)
-                    continue
-                if stat.S_ISLNK(pstat.st_mode):
-                    logger.debug('Skipping symlink %s', ppath)
-                    continue
-                if self._traversed_inodes(pstat.st_ino):
-                    logger.debug('Skipping hardlink or already traversed %s', ppath)
-                    continue
-                if stat.S_ISREG(pstat.st_mode):
-                    if self._min_size <= pstat.st_size:
-                        self._size_to_paths[pstat.st_size].append(ppath)
-                elif stat.S_ISDIR(pstat.st_mode):
-                    self.num_directories += 1
-                    if len(frontier) > 32:
-                        self._pool.submit(self._traverse_path, frontier.popleft())
-                    frontier.append(ppath)
-                else:
-                    logger.debug('Skipping device/socket/unknown: %s', ppath)
-
-    def traverse(self):
-        for r in sorted(set(self._roots)):
-            self._traverse_path(str(r))
-        self._pool.wait_until_complete()
-
-    def size_bytes(self):
-        return sum(k * len(v) for k, v in self._size_to_paths.items())
-
-    def size_bytes_unique(self):
-        return sum(k for k, v in self._size_to_paths.items() if len(v) == 1)
-
-    def files(self):
-        return itertools.chain.from_iterable(self._size_to_paths.values())
-
-    def filter_groups(self):
-        return [(k, v) for k, v in self._size_to_paths.items()
-                if len(v) > 1 and k > 1]
-
-    @classmethod
-    def _unwrap_futures(cls, futures):
-        for f in futures:
-            cls._unwrap_futures(f.result())
-
-
-class DupeFinder:
-    def __init__(self, pool: FutureFreeThreadPool,
-                 comparator: DuplicateComparator = None,
-                 output: typing.Optional[typing.TextIO] = None,
-                 file_progress: typing.Optional[tqdm] = None,
-                 byte_progress: typing.Optional[tqdm] = None):
-        self._pool = pool
-        self._output = output
-        self._file_progress = file_progress
-        self._byte_progress = byte_progress
-        self._comparator = comparator or DuplicateComparator([])
-
-    def find(self, size_bytes: int, paths: typing.List[str]) -> typing.Tuple[str, ...]:
-        files_start = len(paths)
-        if size_bytes > BOUNDARY_CHECK_SIZE * 2:
-            path_groups = tuple(self._split_by_boundaries(size_bytes, paths))
-        else:
-            path_groups = (paths,)
-        files_end = sum(len(p) for p in path_groups)
-        if self._file_progress is not None:
-            self._file_progress.update(files_start - files_end)
-        if self._byte_progress is not None:
-            self._byte_progress.update(size_bytes * (files_start - files_end))
-
-        dupes = []
-        for paths in path_groups:
-            hashes = dict()
-            paths.sort(key=self._comparator.key)
-            for p, hash in zip(paths, self._map(sha256sum, paths, size_bytes)):
-                if not hash:
-                    # some read error occurred
-                    continue
-                existing = hashes.setdefault(hash, p)
-                if existing != p:
-                    dupes.append(p)
-                    if self._output:
-                        with lock:
-                            # ensure these lines are printed atomically
-                            self._output.write(os.path.abspath(p))
-                            self._output.write('\0')
-                            self._output.write(os.path.abspath(existing))
-                            self._output.write('\0')
-                if self._file_progress is not None:
-                    self._file_progress.update(1)
-                if self._byte_progress is not None:
-                    self._byte_progress.update(size_bytes)
-        return tuple(dupes)
-
-    @staticmethod
-    @none_if_io_error
-    def _read_boundary_hash(path: str, size: int) -> int:
-        with open(path, 'rb', buffering=0) as f:
-            if size < 0:
-                f.seek(size, os.SEEK_END)
-            boundary = f.read(abs(size))
-            return hash(boundary)
-
-    def _split_by_boundary(self, size_bytes: int, group: typing.List[str], end: bool):
-        matches = defaultdict(list)
-        size = -BOUNDARY_CHECK_SIZE if end else BOUNDARY_CHECK_SIZE
-        boundaries = self._map(functools.partial(self._read_boundary_hash, size=size), group, size_bytes)
-        for path, edge in zip(group, boundaries):
-            matches[edge].append(path)
-        return [paths for boundary, paths in matches.items()
-                if boundary is not None and len(paths) > 1]
-
-    def _split_by_boundaries(self, size_bytes: int, group: typing.List[str]):
-        groups = self._split_by_boundary(size_bytes, group, end=False)
-        for g in groups:
-            yield from self._split_by_boundary(size_bytes, g, end=True)
-
-    def _map(self, fn, iterables, size_bytes):
-        if len(iterables) < 16 or size_bytes > 2 ** 20 * 32:
-            return map(fn, iterables)
-        return self._pool.map(fn, iterables)
-
-
-@click.command(help="A duplicate file finder that may be faster in environments with "
-                    "millions of files and terabytes of data or over high latency filesystems.")
-@click.argument('input_paths', type=click.Path(
-    exists=True, file_okay=False, readable=True), nargs=-1)
-@click.option('--output', type=click.File('w'),
-              help='Save null-delimited input/duplicate filename pairs. For stdout use "-".')
-@click.option('--verbose', is_flag=True, help='Enable debug logging.')
-@click.option('--progress', is_flag=True, help='Enable progress bars.')
-@click.option('--min-size', type=click.IntRange(min=0), default=1,
-              help='Minimum file size (in bytes) to consider during traversal.')
-@click.option('--read-concurrency', type=click.IntRange(min=1), default=4,
-              help='I/O concurrency for reading files.')
-@click.option('--traversal-concurrency', type=click.IntRange(min=1), default=1,
-              help='I/O concurrency for traversal (stat and listing syscalls).')
-@click.option('--traversal-checkpoint', type=click.Path(),
-              help='Persist the traversal index in jsonl format, or load an '
-                   'existing traversal if already exists. Use .gz extension to compress. Input paths are '
-                   'ignored if a traversal checkpoint is loaded.')
-def main(input_paths, output, verbose, progress, read_concurrency, traversal_concurrency,
-         traversal_checkpoint, min_size):
-    input_paths = [pathlib.Path(p) for p in input_paths]
+def pydupes(*input_paths,
+            progress: bool = True,
+            verbose: bool = False,
+            use_logging: bool = False,
+            read_concurrency: int = 4,
+            traversal_concurrency: int = 1,
+            traversal_checkpoint=None,
+            min_size: int = 1,
+            delete: bool = False
+            ) -> list:
+    logger = logging.getLogger('pydupes')
+    input_paths = [Path(p) for p in input_paths]
     traversal_checkpoint = pathlib.Path(traversal_checkpoint) if traversal_checkpoint else None
     if not input_paths and not traversal_checkpoint:
         click.echo(click.get_current_context().get_help())
@@ -376,7 +198,39 @@ def main(input_paths, output, verbose, progress, read_concurrency, traversal_con
     comparator = DuplicateComparator(input_paths)
 
     time_start = datetime.datetime.now()
-    logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO)
+
+    # def do_log(msg, *args, **kwargs):
+    #     # A SUPER hacky way of doing loggings % string formatting
+    #     dont_eat_these = [' ', '[', ']', '(', ')']
+    #     msg = list(msg)
+    #     for a_i, a in enumerate(args):
+    #         for c_i, c in enumerate(msg):
+    #             if c == '%':
+    #                 if isinstance(a, list):
+    #                     r = a[0]
+    #                 else:
+    #                     r = a
+    #                 msg[c_i] = str(r)
+    #                 i = 1
+    #                 while len(msg) > c_i + 1:
+    #                     if msg[c_i + i] not in dont_eat_these:
+    #                         del msg[c_i + i]
+    #                     else:
+    #                         break
+    #     msg = ''.join(msg)
+    #     tqdm.write(msg)
+    #
+    # old_logging_info = logger.info
+    # if not use_logging:
+    #     logger.info = do_log
+
+    def no_log(msg, *args, **kwargs):
+        return
+
+    if not use_logging:
+        logger.info = no_log
+    else:
+        logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO)
 
     if traversal_checkpoint and traversal_checkpoint.exists():
         size_groups, num_potential_dupes, size_potential_dupes = load_traversal_checkpoint(
@@ -396,10 +250,11 @@ def main(input_paths, output, verbose, progress, read_concurrency, traversal_con
                  position=1, unit_scale=True, unit_divisor=1024,
                  total=size_potential_dupes, mininterval=1,
                  disable=not progress) as bytes_progress:
-
         size_num_dupes = []
-        dupe_finder = DupeFinder(pool=io_pool, output=output, comparator=comparator,
+        dupe_finder = DupeFinder(pool=io_pool, output=None, comparator=comparator,
                                  file_progress=file_progress, byte_progress=bytes_progress)
+
+        duplicate_files = []
 
         def callback(args):
             size, dupes = args
@@ -407,6 +262,8 @@ def main(input_paths, output, verbose, progress, read_concurrency, traversal_con
 
         def return_with_size(size_bytes, group):
             dupes = dupe_finder.find(size_bytes, group)
+            for d in dupes:
+                duplicate_files.append(d)
             return size_bytes, dupes
 
         for size_bytes, group in size_groups:
@@ -417,101 +274,18 @@ def main(input_paths, output, verbose, progress, read_concurrency, traversal_con
                 bytes_progress.update(len(group) * size_bytes)
         scheduler_pool.wait_until_complete()
 
-    dupe_count = 0
-    dupe_total_size = 0
-    for size_bytes, num_dupes in size_num_dupes:
-        dupe_count += num_dupes
-        dupe_total_size += num_dupes * size_bytes
+        dupe_count = 0
+        dupe_total_size = 0
+        for size_bytes, num_dupes in size_num_dupes:
+            dupe_count += num_dupes
+            dupe_total_size += num_dupes * size_bytes
 
-    dt_complete = datetime.datetime.now()
-    logger.info('Comparison time: %.1fs', (dt_complete - dt_filter_start).total_seconds())
-    logger.info('Total time elapsed: %.1fs', (dt_complete - time_start).total_seconds())
-
-    logger.info('Number of duplicate files: %s', dupe_count)
-    logger.info('Size of duplicate content: %s', sizeof_fmt(dupe_total_size))
-
-
-def load_traversal_checkpoint(traversal_checkpoint: pathlib.Path):
-    logger.info('Loading traversal checkpoint from: %s', traversal_checkpoint)
-    f = gzip.open(traversal_checkpoint, 'rt') if traversal_checkpoint.suffix == '.gz' else traversal_checkpoint.open()
-
-    header = json.loads(f.readline())
-    if header.get('schema') != CHECKPOINT_SCHEMA:
-        logger.critical("Traversal schema mismatched -- either malformed or incompatible. Header was: %s", header)
-        exit(3)
-
-    def size_groups_iter():
-        for line in f:
-            size, group = json.loads(line)
-            yield size, group
-
-        f.close()
-
-    num_potential_dupes = header['num_potential_dupes']
-    size_potential_dupes = header['size_potential_dupes']
-    return size_groups_iter(), num_potential_dupes, size_potential_dupes
-
-
-def traverse_paths(progress: bool, traversal_concurrency: int, input_paths: typing.List[pathlib.Path],
-                   traversal_checkpoint: typing.Optional[pathlib.Path], min_size: int):
-    logger.info('Traversing input paths: %s', [str(p.absolute()) for p in input_paths])
-
-    time_start = datetime.datetime.now()
-    with tqdm(smoothing=0, desc='Traversing', unit=' files',
-              disable=not progress, mininterval=1) as file_progress, \
-            FutureFreeThreadPool(threads=traversal_concurrency) as io_pool:
-        crawler = FileCrawler(input_paths, io_pool, file_progress, min_size)
-        crawler.traverse()
-    size = crawler.size_bytes()
-    size_unique = crawler.size_bytes_unique()
-    size_potential_dupes = size - size_unique
-    num_files = sum(1 for _ in crawler.files())
-    size_groups = crawler.filter_groups()
-    num_potential_dupes = sum(len(g) for _, g in size_groups)
-    time_traverse = datetime.datetime.now()
-    logger.info('Traversal time: %.1fs', (time_traverse - time_start).total_seconds())
-    logger.info('Cursory file count: %d (%s), excluding symlinks and dupe inodes',
-                num_files,
-                sizeof_fmt(size))
-    logger.info('Directory count: %d', crawler.num_directories)
-    logger.info('Number of candidate groups: %s (largest is %s files)',
-                len(size_groups), max((len(g) for _, g in size_groups), default=0))
-    logger.info('Size filter reduced file count to: %d (%s)',
-                num_potential_dupes,
-                sizeof_fmt(size_potential_dupes))
-    del crawler
-    size_groups.sort(key=lambda sg: sg[0] * len(sg[1]))
-    if traversal_checkpoint:
-        logger.info('Saving traversal checkpoint to: %s', traversal_checkpoint)
-        with (
-                gzip.open(traversal_checkpoint, 'wt')
-                if traversal_checkpoint.suffix == '.gz'
-                else traversal_checkpoint.open('w')
-        ) as f:
-            json.dump(dict(
-                num_potential_dupes=num_potential_dupes,
-                size_potential_dupes=size_potential_dupes,
-                group_count=len(size_groups),
-                file_count=num_potential_dupes,
-                schema=CHECKPOINT_SCHEMA
-            ), f)
-            f.write('\n')
-
-            prog = tqdm(reversed(size_groups), smoothing=0, desc='Saving traversal checkpoint',
-                        total=len(size_groups), mininterval=1,
-                        disable=not progress)
-            for i, row in enumerate(prog):
-                json.dump(row, f)
-                f.write('\n')
-        logger.info('Traversal checkpoint size: %s',
-                    sizeof_fmt(traversal_checkpoint.stat().st_size))
-
-    def popping_iterator():
-        while size_groups:
-            yield size_groups.pop()
-
-    return popping_iterator(), num_potential_dupes, size_potential_dupes
-
-
-if __name__ == '__main__':
-    main()
+    # dt_complete = datetime.datetime.now()
+    # print(f'Comparison time: {round((dt_complete - dt_filter_start).total_seconds())}')
+    # print(f'Total time elapsed: {round((dt_complete - time_start).total_seconds())}')
+    #
+    # print(f'Number of duplicate files: {dupe_count}')
+    # print(f'Size of duplicate content: {sizeof_fmt(dupe_total_size)}')
+    if delete:
+        delete_dupes(duplicate_files, progress)
+    return duplicate_files
