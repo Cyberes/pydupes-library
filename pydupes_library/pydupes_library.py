@@ -1,32 +1,26 @@
 import datetime
 import logging
 import os
-import shutil
-import subprocess
-import sys
-import time
-from hashlib import sha256
-from itertools import tee
-from logging import Logger
 from pathlib import Path
-from typing import Union
 
-from imohash import hashfile
-from natsort import natsorted
-from pydupes import (DupeFinder, DuplicateComparator, FatalCrawlException,
-                     FileCrawler, FutureFreeThreadPool, main, sizeof_fmt,
-                     traverse_paths)
+from pydupes import (
+    DupeFinder, DuplicateComparator,
+    FutureFreeThreadPool, load_traversal_checkpoint, traverse_paths, sizeof_fmt)
 from tqdm import tqdm
 
 
 def delete_dupes(dupes, progress_bar: bool = True):
+    def do_print(msg):
+        if progress_bar:
+            print(msg)
+
     if len(dupes) == 0:
-        print('No duplicates found.')
+        do_print('No duplicates found.')
         return
     for dupe in tqdm(dupes, disable=(not progress_bar), desc='Deleting files'):
-        tqdm.write(f'[-] {dupe}')
+        tqdm.write(f'[-] {dupe}') if progress_bar else None
         os.remove(dupe)
-    print(f'Deleted {len(dupes)} duplicate files.')
+    do_print(f'Deleted {len(dupes)} duplicate files.')
 
 
 def pydupes(*input_paths,
@@ -37,21 +31,15 @@ def pydupes(*input_paths,
             traversal_checkpoint=None,
             min_size: int = 1,
             delete: bool = False
-            ) -> list:
+            ) -> list[Path]:
     logger = logging.getLogger('pydupes')
     input_paths = [Path(p) for p in input_paths]
-    traversal_checkpoint = pathlib.Path(traversal_checkpoint) if traversal_checkpoint else None
+    traversal_checkpoint = Path(traversal_checkpoint) if traversal_checkpoint else None
     if not input_paths and not traversal_checkpoint:
-        click.echo(click.get_current_context().get_help())
-        exit(1)
+        raise ValueError('No paths specified!')
     comparator = DuplicateComparator(input_paths)
-
     time_start = datetime.datetime.now()
-
-    def no_log(msg, *args, **kwargs):
-        return
-
-    logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO)
+    logging.basicConfig(level=logging.DEBUG if verbose else logging.CRITICAL)
 
     if traversal_checkpoint and traversal_checkpoint.exists():
         size_groups, num_potential_dupes, size_potential_dupes = load_traversal_checkpoint(
@@ -84,7 +72,7 @@ def pydupes(*input_paths,
         def return_with_size(size_bytes, group):
             dupes = dupe_finder.find(size_bytes, group)
             for d in dupes:
-                duplicate_files.append(d)
+                duplicate_files.append(Path(d))
             return size_bytes, dupes
 
         for size_bytes, group in size_groups:
@@ -100,6 +88,12 @@ def pydupes(*input_paths,
         for size_bytes, num_dupes in size_num_dupes:
             dupe_count += num_dupes
             dupe_total_size += num_dupes * size_bytes
+
+    dt_complete = datetime.datetime.now()
+    logger.info(f'Comparison time: {round((dt_complete - dt_filter_start).total_seconds())}')
+    logger.info(f'Total time elapsed: {round((dt_complete - time_start).total_seconds())}')
+    logger.info(f'Number of duplicate files: {dupe_count}')
+    logger.info(f'Size of duplicate content: {sizeof_fmt(dupe_total_size)}')
 
     if delete:
         delete_dupes(duplicate_files, progress)
